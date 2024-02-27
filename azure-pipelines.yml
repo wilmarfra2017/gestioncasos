@@ -1,0 +1,204 @@
+trigger:
+- develop
+- staging
+- master
+
+variables:
+- name: buildConfiguration
+  value: 'Release'
+- name: tag
+  value: "$(Build.BuildId)"
+- name: imageRepository
+  value: "gestion-casos-api"
+- name: containerRegistry
+  value: "acrhumanointermediary.azurecr.io"
+- name: dockerfilePath
+  value: "Dockerfile"
+- name: acrServiceConnection
+  value: "acrhumanointermediary"
+
+- ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+  - name: opsEnvName
+    value: prod
+
+- ${{ if eq(variables['Build.SourceBranchName'], 'staging') }}:
+  - name: opsEnvName
+    value: qa
+
+- ${{ if eq(variables['Build.SourceBranchName'], 'develop') }}:
+  - name: opsEnvName
+    value: dev
+
+stages:
+- stage: BuildAndTest
+  displayName: 'Build & Test Stage'
+  jobs:
+    - job: Build
+      pool:
+        vmImage: 'windows-2022'
+      steps:
+        - task: NodeTool@0
+          displayName: 'Use Node 16.x'
+          inputs:
+            versionSpec: 16.x
+        - script: 'npm install -g azurite'
+          displayName: 'Install azurite'
+        - script: 'start /B azurite'
+          displayName: 'Run azurite'
+        - task: SonarQubePrepare@5
+          displayName: "Preparando análisis Sonar..."
+          inputs:
+            SonarQube: 'sonarqubeconnections'
+            scannerMode: 'MSBuild'
+            projectKey: 'Gesti_n_Casos_gestion-casos-api_e0bb4d99-bc3a-48b7-b03b-d492d94dfc60'
+            projectName: 'gestion-casos-api'
+            extraProperties: |
+              sonar.language=cs
+              sonar.exclusions=**/Exceptions/*,**/Filters/*
+              sonar.coverage.exclusions=**/Exceptions/*,**/Filters/*
+              sonar.cs.opencover.reportsPaths=$(Build.SourcesDirectory)/**/coverage.opencover.xml
+              sonar.cs.vscoveragexml.reportsPaths=$(Agent.TempDirectory)/**/*.coveragexml
+              sonar.cs.vstest.reportsPaths=$(Agent.TempDirectory)/*.trx
+              sonar.scanner.metadataFilePath=$(Agent.TempDirectory)/sonar/$(Build.BuildNumber)/test/report-task.txt
+          condition: eq(variables['opsEnvName'], 'dev')
+          enabled: true
+        - task: DotNetCoreCLI@2
+          displayName: ".NET Build  $(buildConfiguration)"
+          inputs:
+            command: 'build'
+            projects: '**/*.csproj'
+            arguments: '--configuration  $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/buildRelease'
+            zipAfterPublish: true
+        - task: DotNetCoreCLI@2
+          displayName: 'dotnet test'
+          inputs:
+            command: 'test'
+            arguments: '--configuration $(BuildConfiguration)  --collect "Code Coverage"'
+            publishTestResults: true
+            projects: '**/*Tests.csproj' 
+        - powershell: |
+            $ver = (Get-ChildItem $env:USERPROFILE\.nuget\packages\Microsoft.CodeCoverage | Select-Object -Property Name | Sort-Object -Descending | Select-Object -First 1).Name
+                    
+                  Get-ChildItem -Recurse -Filter "*.coverage" | % {
+                  $outfile = "$([System.IO.Path]::GetFileNameWithoutExtension($_.FullName)).coveragexml"
+                  $output = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($_.FullName), $outfile)
+                  "Analyse '$($_.FullName)' with output '$output'..."
+                  . $env:USERPROFILE\.nuget\packages\microsoft.codecoverage\$ver\build\netstandard1.0\CodeCoverage\CodeCoverage.exe analyze /output:$output $_.FullName
+                  }
+                  "Done"
+          displayName: 'CodeCoverage Analysis Script'
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'drop'
+            publishLocation: 'Container'
+        - task: SonarQubeAnalyze@5
+          displayName: "Ejecutando análisis Sonar..."
+          inputs:
+            jdkversion: 'JAVA_HOME_17_X64'
+          condition: eq(variables['opsEnvName'], 'dev')
+          enabled: true
+        - task: SonarQubePublish@5
+          displayName: "Publicando resultados del análisis ..."
+          inputs:
+            pollingTimeoutSec: '300'
+          condition: eq(variables['opsEnvName'], 'dev')
+          enabled: true
+        - task: PublishCodeCoverageResults@1
+          displayName: 'Publish code coverage report'
+          inputs:
+            codeCoverageTool: 'Cobertura'
+            summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+- stage: CheckVulnerable
+  displayName: Check for vulnerable packages
+  dependsOn: BuildAndTest
+  jobs:
+    - job: CheckVulnerable
+      displayName: CheckVulnerable job
+      pool:
+        vmImage: 'windows-2022'
+      steps:
+      - powershell: |
+          $vul = dotnet list .\gestion_casos_api.sln package --vulnerable | Select-String 'has the following'
+                if ($vul){
+                  Exit -1
+                }
+                Exit 0        
+        displayName: 'Check for vulnerable packages'
+
+      - script: |
+          dotnet tool install --global dotnet-project-licenses
+              dotnet-project-licenses --input gestion_casos_api.sln > licenses.log 2>&1
+        displayName: 'Dotnet project licenses'
+
+      - script: |
+          type licenses.log
+                findstr /i /C:"agpl" /C:"Open Software License" licenses.log > nul
+                if %errorlevel% equ 0 (
+                    echo Has AGPL or Open Software Licenses given current sources.
+                    exit /b 1
+                ) else (
+                    echo Does not have AGPL or Open Software Licenses given current sources.
+                    exit /b 0
+                )
+        displayName: 'Check AGPL or Open Sofware licenses'
+
+      - script: |
+          type licenses.log
+                findstr /i /C:"gpl" licenses.log > nul
+                if %errorlevel% equ 0 (
+                    echo Has GPL Licenses given current sources, check manually.
+                    exit /b 1
+                ) else (
+                    echo Does not have GPL Licenses given current sources.
+                    exit /b 0
+                )        
+        displayName: 'Check GPL licenses'
+
+- stage: BuildDockerImage
+  displayName: Build Docker Image
+  jobs:
+    - job: Build
+      displayName: Build job
+      pool:
+        vmImage: "ubuntu-latest"
+      steps:
+        - task: Docker@2
+          displayName: 'Build'
+          inputs:
+            command: build
+            repository: $(imageRepository)
+            dockerfile: $(dockerfilePath)
+            containerRegistry: $(acrServiceConnection)
+            tags: $(tag)
+      
+        - task: Docker@2
+          displayName: Push
+          inputs:
+            command: push
+            repository: $(imageRepository)
+            containerRegistry: $(acrServiceConnection)
+            tags: $(tag)
+
+- stage: Deploy
+  displayName: Modify manifest with the new Docker image
+  dependsOn: BuildDockerImage
+  jobs:
+    - deployment: Deploy
+      environment: $(imageRepository)-$(opsEnvName)
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: git://Gestión Casos/gestion-casos-api-gitops
+              persistCredentials: true
+            - bash: |
+                git config --global user.email "devops@azure.com"
+                git config --global user.name "Azure DevOps pipeline"
+                git checkout $(Build.SourceBranchName)  
+                kubectl patch --local -f k8s/deployment.yaml -p '{"spec":{"template":{"spec":{"containers":[{"name":"$(imageRepository)-$(opsEnvName)-ctr","image":"$(containerRegistry)/$(imageRepository):$(tag)"}]}}}}' -o yaml > temp.yaml && mv temp.yaml k8s/deployment.yaml
+                cat k8s/deployment.yaml
+                git add .
+                git commit -m "chore: Update $(imageRepository) to $(tag)"
+                git push
+              displayName: Update manifest
